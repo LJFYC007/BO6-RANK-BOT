@@ -426,19 +426,21 @@ async def my_history(msg: Message):
         _log.exception(f"Error in my_history | {e}")
         await msg.reply(f"err\n```\n{traceback.format_exc()}\n```")
         
-def sigmoid(x, mid, k=5):
+def sigmoid(x, mid, k):
     return 1 / (1 + math.exp(-k * (x - mid)))
 
 # 计算隐藏分
 def calculate_hidden_score(user: str, map: str, mode: str, result: str, score_group0: int, score_group1: int, kd: float, kills: int):
     score_diff = abs(score_group0 - score_group1) / max(score_group0, score_group1) 
-    score_change = sigmoid(score_diff, 0.5) * 2 - 1
+    score_change = sigmoid(score_diff, 0.5, 5) * 2 - 1
     score_change = score_change * 10 + 30
-    score_change = score_change * sigmoid(kd, 1, 1) * 2
    
-    score_change = int(score_change)
     if result == "Loss":
+        score_change = score_change / (sigmoid(kd, 1, 1) * 2)
         score_change = -score_change
+    else:
+        score_change = score_change * (sigmoid(kd, 1, 1) * 2)
+    score_change = int(score_change)
     old_score = user_hidden_score.get_hidden_score(user)
     new_score = old_score + score_change
     
