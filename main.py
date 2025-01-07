@@ -3,6 +3,7 @@ import asyncio
 import traceback
 import os
 import copy
+import math
 import random
 import json
 import my_queue
@@ -13,6 +14,7 @@ from khl.card import Card,CardMessage,Types,Module,Element
 from aiohttp import client_exceptions
 from datetime import datetime,timedelta
 from itertools import combinations
+from asyncio import Queue
 
 from utils.files import config,RollLog,StartTime,write_roll_log
 from utils.myLog import get_time,get_time_str_from_stamp,log_msg,_log
@@ -29,6 +31,8 @@ kook_base_url = "https://www.kookapp.cn"
 kook_headers = {f'Authorization': f"Bot {config['token']}"}
 CmdLock = asyncio.Lock()
 """配置命令上锁"""
+user_message_queue = Queue()
+waiting_for_input = {}
 
 # 按隐藏分平均分组
 def split_into_groups(users):
@@ -78,11 +82,55 @@ async def alive_check(msg: Message, *args):
     except Exception as result:
         _log.exception("Err in alive")
 
+async def help_card(help_text=""):
+    text = ""
+    
+    if "notice" in config:
+        text += f"【公告】\n{config['notice']}\n\n"
+    
+    text += "🛠️ **可用命令**\n"
+    text += "・**/alive** - 查看 bot 是否在线\n"
+    text += "・**/queue <队列名字> <持续时间（分钟）> <最大用户数（默认为8）>** - 创建队列，人满后自动分组\n"
+    text += "・**/join <队列编号>** - 加入指定队列\n"
+    text += "・**/queueinfo <队列编号>** - 查询队列分组信息\n"
+    text += "・**/recordmatch <队列编号> <地图> <模式> <1队分数> <2队分数>** - 记录比赛结果\n"
+    text += "・**/myhistory** - 查询个人历史战绩\n"
+    
+    if help_text != "":
+        text += f"\n📄 **详细信息**\n{help_text}"
+    
+    # 小字部分
+    sub_text = f"开机于：{StartTime}  |  开源仓库：[Github](https://github.com/LJFYC007/BO6-RANK-BOT)\n"
+    
+    # 返回格式化后的帮助卡片信息
+    return await get_card_msg(text, sub_text, header_text="BO6-RANK-BOT 帮助命令")
+
+
+BOT_USER_ID = ""
+@bot.on_message()
+async def at_help_cmd(msg:Message):
+    try:
+        if msg.author_id == "3989343843": return
+        if len(msg.content) > 22: return
+        global BOT_USER_ID
+        if BOT_USER_ID == "":
+            cur_bot = await bot.client.fetch_me()
+            BOT_USER_ID = cur_bot.id
+        if f"(met){BOT_USER_ID}(met)" in msg.content:
+            log_msg(msg)
+            await msg.reply(await help_card())
+            _log.info(f"Au:{msg.author_id} | at_help reply")
+    except Exception as result:
+        _log.exception(f"Err in at_help")
+
 # Command: Start a new queue
 @bot.command(name='queue', case_sensitive=False)
 async def start_queue(msg: Message, name: str, duration: int, max_users: int = 8):
     try: 
         log_msg(msg)
+        if msg.author_id not in config['admin_user']:
+            await msg.reply("❌ 你没有权限执行此操作！")
+            return
 
         queue_id = my_queue.queue_counter + 1
         card = Card(
@@ -141,34 +189,25 @@ async def admin_join_queue(msg: Message, queue_id: int, username: str):
     try:
         log_msg(msg)
 
-        # 权限检查 - 只有管理员用户可以使用此命令
         if msg.author_id not in config['admin_user']:
             await msg.reply("❌ 你没有权限执行此操作！")
             return
 
-        # 检查队列是否存在
         if queue_id not in my_queue.queue_data:
             await msg.reply(f"❌ 接龙 #{queue_id} 不存在！")
             return
 
         queue = my_queue.queue_data[queue_id]
-
-        # 检查队列是否已经结束
         if queue['end_time'] <= datetime.now():
             await msg.reply(f"❌ 接龙 #{queue_id} 已结束，无法加入！")
             return
-
-        # 检查队列是否已满
         if len(queue['users']) >= queue['max_users']:
             await msg.reply(f"❌ 接龙 #{queue_id} 已满，无法加入！")
             return
-
-        # 检查用户是否已在队列中
         if username in queue['users']:
             await msg.reply(f"❌ 用户 {username} 已在接龙 #{queue_id} 中！")
             return
 
-        # 管理员代替用户加入队列
         my_queue.join_queue(queue_id, username)
         card = Card(
             Module.Header(f"🎉 接龙 #{queue_id} 进行中！{queue['name']}"),
@@ -292,7 +331,122 @@ async def set_group(msg: Message, queue_id: int, *user_ids):
         _log.exception(f"Error in set_group | {e}")
         await msg.reply(f"err\n```\n{traceback.format_exc()}\n```")
 
-# 开机任务
+# Command: Record match result and update hidden scores
+@bot.command(name='recordmatch', case_sensitive=False)
+async def record_match(msg: Message, queue_id: int, map: str, mode: str, score_group0: int, score_group1: int):
+    try:
+        log_msg(msg)
+        if msg.author_id not in config['admin_user']:
+            await msg.reply("❌ 你没有权限执行此操作！")
+            return
+        if queue_id not in my_queue.queue_data:
+            await msg.reply(f"❌ 接龙 #{queue_id} 不存在！")
+            return
+
+        queue = my_queue.queue_data[queue_id]
+        groups = queue.get('groups', [])
+        if len(groups) != 2:
+            await msg.reply(f"❌ 接龙 #{queue_id} 的分组数据不完整！")
+            return
+
+        if score_group0 > score_group1:
+            winning_group = groups[0]
+            losing_group = groups[1]
+        else:
+            winning_group = groups[1]
+            losing_group = groups[0]
+        await msg.reply(f"✅ 接龙 #{queue_id} 的比赛结果已成功录入！\n"
+                        f"⚔️ 比分: {score_group0} - {score_group1}\n"
+                        f"接下来，请依次输入每个选手的战绩信息。", use_quote=False)
+
+        info = {}
+        async def get_kd_kills_for_user(user: str):
+            await msg.reply(f"请输入 {user} 的战绩（格式：击杀数 死亡数）：", use_quote=False)
+            waiting_for_input[msg.author_id] = True
+            while waiting_for_input[msg.author_id]:
+                await asyncio.sleep(0.5)
+            user_input = await user_message_queue.get()
+            try:
+                kills, deaths = user_input.split()
+                info[user] = {"kd": round(float(kills) / float(deaths), 2), "kills": int(kills)}
+            except ValueError:
+                await msg.reply(f"输入格式错误，请重新输入！")
+                await get_kd_kills_for_user(user)
+
+        for user in winning_group + losing_group:
+            await get_kd_kills_for_user(user)
+
+        hidden_score_updates = []
+        for user in winning_group:
+            kd = info[user]["kd"]
+            kills = info[user]["kills"]
+            old_score, new_score, score_change = calculate_hidden_score(user, map, mode, "Win", score_group0, score_group1, kd, kills)
+            hidden_score_updates.append(f"{user}: {old_score} ➡️ {new_score} (+{score_change})  KD: {kd}, Kills: {kills}")
+        for user in losing_group:
+            kd = info[user]["kd"]
+            kills = info[user]["kills"]
+            old_score, new_score, score_change = calculate_hidden_score(user, map, mode, "Loss", score_group0, score_group1, kd, kills)
+            hidden_score_updates.append(f"{user}: {old_score} ➡️ {new_score} (-{-score_change})  KD: {kd}, Kills: {kills}")
+
+        hidden_scores_text = "\n".join(hidden_score_updates)
+        await debug_ch.send(CardMessage(Card(
+            Module.Header(f"🎮 接龙 #{queue_id} 比赛结果已录入！"),
+            Module.Section(Element.Text(f"📋 地图: {map}\n🎮 模式: {mode}", Types.Text.KMD)),
+            Module.Section(Element.Text(f"⚔️ 比分: {score_group0} - {score_group1}", Types.Text.KMD)),
+            Module.Section(Element.Text(f"📊 隐藏分更新:\n{hidden_scores_text}", Types.Text.KMD))
+        )))
+
+    except Exception as e:
+        _log.exception(f"Error in record_match | {e}")
+        await msg.reply(f"err\n\n{traceback.format_exc()}\n")
+
+@bot.on_message()
+async def handle_user_message(msg: Message):
+    if msg.author_id in waiting_for_input and waiting_for_input[msg.author_id]:
+        await user_message_queue.put(msg.content)
+        waiting_for_input[msg.author_id] = False
+
+# Command: Query user's match history
+@bot.command(name='myhistory', case_sensitive=False)
+async def my_history(msg: Message):
+    try:
+        log_msg(msg)
+        user = msg.author.nickname
+        history = user_hidden_score.get_match_history(user)
+        if not history:
+            await msg.reply(f"📋 {user} 的历史战绩为空！")
+            return
+        history_text = "\n".join([
+            f"日期: {datetime.fromisoformat(match[6]).strftime('%Y-%m-%d')} | 地图: {match[0]} | 模式: {match[1]} | 结果: {match[2]} | ️比分: {match[3]} | KD: {match[4]} | Kills: {match[5]}"
+            for match in history
+        ])
+        await msg.reply(f"📋 **{user} 的历史战绩**\n{history_text}", use_quote=False)
+        _log.info(f"History queried for user {user}")
+    except Exception as e:
+        _log.exception(f"Error in my_history | {e}")
+        await msg.reply(f"err\n```\n{traceback.format_exc()}\n```")
+        
+def sigmoid(x, mid, k=5):
+    return 1 / (1 + math.exp(-k * (x - mid)))
+
+# 计算隐藏分
+def calculate_hidden_score(user: str, map: str, mode: str, result: str, score_group0: int, score_group1: int, kd: float, kills: int):
+    score_diff = abs(score_group0 - score_group1) / max(score_group0, score_group1) 
+    score_change = sigmoid(score_diff, 0.5) * 2 - 1
+    score_change = score_change * 10 + 30
+    score_change = score_change * sigmoid(kd, 1, 1) * 2
+   
+    score_change = int(score_change)
+    if result == "Loss":
+        score_change = -score_change
+    old_score = user_hidden_score.get_hidden_score(user)
+    new_score = old_score + score_change
+    
+    user_hidden_score.add_match_history(user, map, mode, result, f"{score_group0}:{score_group1}" if result == "Win" else f"{score_group1}:{score_group0}", kd, kills)
+    user_hidden_score.update_hidden_score(user, new_score)
+    return old_score, new_score, score_change
+
+# 开机任
 @bot.on_startup
 async def startup_task(b:Bot):
     try:
